@@ -54,7 +54,7 @@ jobs:
         env:
           CONDA: C:\ProgramData\miniconda3
         with:
-          activate-environment: CloudCompareDev
+          activate-environment: CloudCompareDevPCL-1-13-1
           auto-activate-base: false
           environment-file: .ci/conda.yml
           #miniconda-version: 'latest'
@@ -106,7 +106,7 @@ jobs:
             -DPLUGIN_IO_QRDB_INSTALL_DEPENDENCY=ON \
             -DPLUGIN_IO_QSTEP=OFF \
             -DPLUGIN_STANDARD_3DMASC=OFF \
-            -DPLUGIN_STANDARD_QANIMATION=ON \
+            -DPLUGIN_STANDARD_QANIMATION=OFF \
             -DQANIMATION_WITH_FFMPEG_SUPPORT=ON \
             -DPLUGIN_STANDARD_QBROOM=ON \
             -DPLUGIN_STANDARD_QCANUPO=OFF \
