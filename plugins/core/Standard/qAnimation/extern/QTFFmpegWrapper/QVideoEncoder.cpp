@@ -111,10 +111,10 @@ bool QVideoEncoder::GetSupportedOutputFormats(std::vector<OutputFormat>& formats
 	try
 	{
 		// list of all output formats
-		AVOutputFormat* prev = nullptr;
+		void *ofmt_opaque = NULL;
 		while (true)
 		{
-			AVOutputFormat* format = av_oformat_next(prev);
+			AVOutputFormat* format = const_cast<AVOutputFormat*>(av_muxer_iterate(&ofmt_opaque));
 			if (format)
 			{
 				//potentially skip the output formats without any extension (= test formats mostly)
@@ -130,7 +130,6 @@ bool QVideoEncoder::GetSupportedOutputFormats(std::vector<OutputFormat>& formats
 					}
 					formats.push_back(f);
 				}
-				prev = format;
 			}
 			else
 			{
@@ -164,7 +163,7 @@ bool QVideoEncoder::open(QString formatShortName, QStringList& errors)
 	AVOutputFormat* outputFormat = NULL;
 	if (!formatShortName.isEmpty())
 	{
-		outputFormat = av_guess_format(qPrintable(formatShortName), NULL, NULL);
+		outputFormat = const_cast<AVOutputFormat*>(av_guess_format(qPrintable(formatShortName), NULL, NULL));
 		if (!outputFormat)
 		{
 			errors << "Could not find output format from short name: " + formatShortName;
@@ -197,7 +196,7 @@ bool QVideoEncoder::open(QString formatShortName, QStringList& errors)
 	AVCodecID codec_id = m_ff->formatContext->oformat->video_codec;
 	//codec_id = AV_CODEC_ID_MPEG1VIDEO;
 	//codec_id = AV_CODEC_ID_H264;
-	AVCodec *pCodec = avcodec_find_encoder(codec_id);
+	AVCodec *pCodec = const_cast<AVCodec*>(avcodec_find_encoder(codec_id));
 	if (!pCodec)
 	{
 		errors << "Could not load the codec";
@@ -247,7 +246,7 @@ bool QVideoEncoder::open(QString formatShortName, QStringList& errors)
 		return false;
 	}
 	m_ff->videoStream->id = m_ff->formatContext->nb_streams-1;
-	m_ff->videoStream->codec = m_ff->codecContext;
+	avcodec_parameters_from_context(m_ff->videoStream->codecpar, m_ff->codecContext);
 	m_ff->videoStream->time_base.num = 1;
 	m_ff->videoStream->time_base.den = m_fps;
 
@@ -274,7 +273,7 @@ bool QVideoEncoder::open(QString formatShortName, QStringList& errors)
 	}
 
 	int	err = avformat_write_header(m_ff->formatContext, NULL);
-	
+
 	if ( err != 0 )
 	{
 		errors << QString("Could not write header for '%1'").arg(m_filename);
@@ -293,7 +292,7 @@ static int write_frame(FFmpegStuffEnc* ff, AVPacket *pkt)
 		assert(ff);
 		return 0;
 	}
-	
+
 	//if (ff->codecContext->coded_frame->key_frame)
 	//{
 	//	pkt->flags |= AV_PKT_FLAG_KEY;
@@ -314,16 +313,18 @@ bool QVideoEncoder::close()
 		return false;
 	}
 
+	int ret;
+	ret = avcodec_send_frame(m_ff->codecContext, 0);
+
 	// delayed frames?
-	while (true)
+	while (ret >= 0)
 	{
 		AVPacket pkt;
-		memset( &pkt, 0, sizeof( AVPacket ) );		
+		memset( &pkt, 0, sizeof( AVPacket ) );
 		av_init_packet(&pkt);
 
-		int got_packet = 0;
-		int ret = avcodec_encode_video2(m_ff->codecContext, &pkt, 0, &got_packet);
-		if (ret < 0 || !got_packet)
+		ret = avcodec_receive_packet(m_ff->codecContext, &pkt);
+		if (ret < 0)
 		{
 			break;
 		}
@@ -336,13 +337,12 @@ bool QVideoEncoder::close()
 	av_write_trailer(m_ff->formatContext);
 
 	// close the codec
-	avcodec_close(m_ff->videoStream->codec);
+	avcodec_close(m_ff->codecContext);
 
 	// free the streams and other data
 	freeFrame();
 	for(unsigned i = 0; i < m_ff->formatContext->nb_streams; i++)
 	{
-		av_freep(&m_ff->formatContext->streams[i]->codec);
 		av_freep(&m_ff->formatContext->streams[i]);
 	}
 
@@ -377,14 +377,27 @@ bool QVideoEncoder::encodeImage(const QImage &image, int frameIndex, QString* er
 	av_init_packet(&pkt);
 
 	// encode the image
-	int got_packet = 0;
+	int ret;
+	//compute correct timestamp based on the input frame index
+	//int timestamp = ((m_ff->codecContext->time_base.num * 90000) / m_ff->codecContext->time_base.den) * frameIndex;
+	m_ff->frame->pts = frameIndex/*timestamp*/;
+	ret = avcodec_send_frame(m_ff->codecContext, m_ff->frame);
+	if (ret != AVERROR(EAGAIN) && ret < 0)
 	{
-		//compute correct timestamp based on the input frame index
-		//int timestamp = ((m_ff->codecContext->time_base.num * 90000) / m_ff->codecContext->time_base.den) * frameIndex;
-		m_ff->frame->pts = frameIndex/*timestamp*/;
-
-		int ret = avcodec_encode_video2(m_ff->codecContext, &pkt, m_ff->frame, &got_packet);
-		if (ret < 0)
+		char errorStr[AV_ERROR_MAX_STRING_SIZE] = {0};
+		av_make_error_string(errorStr, AV_ERROR_MAX_STRING_SIZE, ret);
+		if (errorString)
+			*errorString = QString("Error submitting frame to the encoder: %1").arg(errorStr);
+		return false;
+	}
+	while (ret > 0)
+	{
+		ret = avcodec_receive_packet(m_ff->codecContext, &pkt);
+		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+		{
+			break;
+		}
+		else if (ret < 0)
 		{
 			char errorStr[AV_ERROR_MAX_STRING_SIZE] = {0};
 			av_make_error_string(errorStr, AV_ERROR_MAX_STRING_SIZE, ret);
@@ -392,23 +405,20 @@ bool QVideoEncoder::encodeImage(const QImage &image, int frameIndex, QString* er
 				*errorString = QString("Error encoding video frame: %1").arg(errorStr);
 			return false;
 		}
-	}
-
-	if (got_packet)
-	{
-		int ret = write_frame(m_ff, &pkt);
-		if (ret < 0)
+		else
 		{
-			char errorStr[AV_ERROR_MAX_STRING_SIZE] = {0};
-			av_make_error_string(errorStr, AV_ERROR_MAX_STRING_SIZE, ret);
-			if (errorString)
-				*errorString = QString("Error while writing video frame: %1").arg(errorStr);
-			return false;
+			ret = write_frame(m_ff, &pkt);
+			if (ret < 0)
+			{
+				char errorStr[AV_ERROR_MAX_STRING_SIZE] = {0};
+				av_make_error_string(errorStr, AV_ERROR_MAX_STRING_SIZE, ret);
+				if (errorString)
+					*errorString = QString("Error while writing video frame: %1").arg(errorStr);
+				return false;
+			}
 		}
 	}
 
-	av_packet_unref(&pkt);
-	
 	return true;
 }
 
@@ -421,7 +431,7 @@ bool QVideoEncoder::convertImage_sws(const QImage &image, QString* errorString/*
 			*errorString = "Wrong image size";
 		return false;
 	}
-	
+
 	QImage::Format format = image.format();
 	if (	format != QImage::Format_RGB32
 		&&	format != QImage::Format_ARGB32
